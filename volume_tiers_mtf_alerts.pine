@@ -1,0 +1,430 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════
+//  VOLUME TIERS — MULTI-TIMEFRAME ALERTS
+//
+//  Fires when a bar's volume reaches 1.5x, 2.5x or 5x its own average,
+//  on whichever of 4H / 1D / 15D / 1W / 1M you enable.
+//
+//  THE AVERAGE
+//    Each timeframe uses its OWN average over the period you set (default
+//    20). The 1D row compares against 20 days, the 1M row against 20
+//    months. The current bar is EXCLUDED from its own average, so a big
+//    bar cannot inflate the number it is being judged against.
+//
+//  THE TIERS
+//    A bar reports the HIGHEST tier it reaches, so a 6x bar is reported as
+//    5x, not as all three. Each tier has its own alert, so you can send
+//    5x events somewhere different from 1.5x events.
+//
+//  SETTING ALERTS
+//    Right-click → Add alert → Condition: this indicator → then pick from
+//    the dropdown. There is one entry per timeframe per tier, e.g.
+//      "1D >= 2.5x"      "15D >= 5x"     "1W >= 1.5x"
+//    plus "Any" catch-alls:
+//      "Any TF >= 1.5x"  "Any TF >= 2.5x"  "Any TF >= 5x"
+//    Trigger: Once per bar close.
+//    Or use "Any alert() function call" for one alert covering everything,
+//    with the timeframe and exact multiple in the message text.
+//
+//  LIVE FIRING — alerts do NOT wait for the candle to close
+//    Readings come from the still-forming bar of each timeframe, so an
+//    alert arrives the moment a tier is reached. A monthly alert can
+//    therefore arrive mid-month.
+//    This does not repaint: volume only accumulates within a bar, never
+//    falls, so a tier once reached stays reached until the bar closes.
+//    Each tier alerts at most once per bar. If a bar climbs from 1.5x to
+//    2.5x later in the period, the higher tier alerts as well.
+//    In the alert dialog choose Trigger: ONCE PER BAR (not once per bar
+//    close, which would delay everything to the close).
+//  Timeframes below your chart timeframe are skipped, since they would
+//  return only partial data.
+// ═══════════════════════════════════════════════════════════════════════
+
+indicator("Volume Tiers — MTF Alerts", shorttitle = "VOL TIERS", overlay = true)
+
+// ── Average ───────────────────────────────────────────────────────────
+gV = "Average volume"
+avgLen  = input.int(20, "Period", minval = 2, maxval = 500, group = gV,
+     tooltip = "Bars in the average, applied on each timeframe separately. 20, 30, 50 — whatever you prefer.")
+avgType = input.string("SMA", "Type", options = ["SMA", "EMA", "WMA", "Median"], group = gV,
+     tooltip = "SMA matches TradingView's built-in Volume indicator. Median ignores outlier bars, so one huge bar does not lift the reference for everything after it.")
+
+// ── Tiers ─────────────────────────────────────────────────────────────
+gT = "Tiers"
+t1On = input.bool(true, "Tier 1", inline = "x1", group = gT)
+t1   = input.float(1.5, "", inline = "x1", minval = 0.1, step = 0.1, group = gT)
+t2On = input.bool(true, "Tier 2", inline = "x2", group = gT)
+t2   = input.float(2.5, "", inline = "x2", minval = 0.1, step = 0.1, group = gT)
+t3On = input.bool(true, "Tier 3", inline = "x3", group = gT)
+t3   = input.float(5.0, "", inline = "x3", minval = 0.1, step = 0.1, group = gT)
+
+// ── Timeframes ────────────────────────────────────────────────────────
+gA = "Timeframes"
+a4  = input.bool(false, "4 Hour",  group = gA)
+aD  = input.bool(true,  "1 Day",   group = gA)
+a15 = input.bool(true,  "15 Day",  group = gA)
+aW  = input.bool(true,  "1 Week",  group = gA)
+aM  = input.bool(true,  "1 Month", group = gA)
+
+// ── Core ──────────────────────────────────────────────────────────────
+// Average of the PREVIOUS avgLen bars. Falls back to the average of all
+// prior bars while history is short, so new listings are covered too.
+f_avg() =>
+    float v = volume[1]
+    float a = avgType == "EMA"    ? ta.ema(v, avgLen) :
+              avgType == "WMA"    ? ta.wma(v, avgLen) :
+              avgType == "Median" ? ta.median(v, avgLen) : ta.sma(v, avgLen)
+    var float cum = 0.0
+    cum += volume
+    float expAvg = bar_index > 0 ? (cum - volume) / bar_index : na
+    na(a) ? expAvg : a
+
+// No [1] anywhere here: this reads the LIVE, still-forming bar.
+f_state() =>
+    float avg   = f_avg()
+    float ratio = avg > 0 ? volume / avg : 0.0
+    bool  ok    = bar_index >= 1 and avg > 0
+    [ratio, ok, close, time]
+
+f_get(simple string _tf) =>
+    request.security(syminfo.tickerid, _tf, f_state(), lookahead = barmerge.lookahead_off)
+
+f_allowed(simple string _tf) =>
+    timeframe.in_seconds(_tf) >= timeframe.in_seconds(timeframe.period)
+
+[rat4,  ok4,  c4,  s4 ] = f_get("240")
+[ratD,  okD,  cD,  sD ] = f_get("1D")
+[rat15, ok15, c15, s15] = f_get("15D")
+[ratW,  okW,  cW,  sW ] = f_get("1W")
+[ratM,  okM,  cM,  sM ] = f_get("1M")
+
+// This timeframe is enabled and usable on this chart
+bool nw4  = a4  and f_allowed("240") and ok4
+bool nwD  = aD  and f_allowed("1D")  and okD
+bool nw15 = a15 and f_allowed("15D") and ok15
+bool nwW  = aW  and f_allowed("1W")  and okW
+bool nwM  = aM  and f_allowed("1M")  and okM
+
+// Escalation latch: per timeframe, remember which bar we are in and the
+// highest tier already alerted for it. A tier fires the first moment it is
+// reached; a later climb to a higher tier fires that one too.
+// FIX: varip (not var) so the latch survives realtime ticks instead of
+// rolling back each tick, and bar trackers start at 0 (not na) because a
+// comparison with na is always false, which meant the latch never reset.
+varip int bar4  = 0
+varip int barD  = 0
+varip int bar15 = 0
+varip int barW  = 0
+varip int barM  = 0
+varip int lvl4  = 0
+varip int lvlD  = 0
+varip int lvl15 = 0
+varip int lvlW  = 0
+varip int lvlM  = 0
+
+if bar4 != s4
+    bar4  := s4
+    lvl4  := 0
+if barD != sD
+    barD  := sD
+    lvlD  := 0
+if bar15 != s15
+    bar15 := s15
+    lvl15 := 0
+if barW != sW
+    barW  := sW
+    lvlW  := 0
+if barM != sM
+    barM  := sM
+    lvlM  := 0
+
+f_hit(bool _live, float _ratio, bool _on, float _mult, int _lvl, int _tier) =>
+    _live and _on and _ratio >= _mult and _tier > _lvl
+
+bool h4_1 = f_hit(nw4, rat4, t1On, t1, lvl4, 1)
+bool h4_2 = f_hit(nw4, rat4, t2On, t2, lvl4, 2)
+bool h4_3 = f_hit(nw4, rat4, t3On, t3, lvl4, 3)
+
+bool hD_1 = f_hit(nwD, ratD, t1On, t1, lvlD, 1)
+bool hD_2 = f_hit(nwD, ratD, t2On, t2, lvlD, 2)
+bool hD_3 = f_hit(nwD, ratD, t3On, t3, lvlD, 3)
+
+bool h15_1 = f_hit(nw15, rat15, t1On, t1, lvl15, 1)
+bool h15_2 = f_hit(nw15, rat15, t2On, t2, lvl15, 2)
+bool h15_3 = f_hit(nw15, rat15, t3On, t3, lvl15, 3)
+
+bool hW_1 = f_hit(nwW, ratW, t1On, t1, lvlW, 1)
+bool hW_2 = f_hit(nwW, ratW, t2On, t2, lvlW, 2)
+bool hW_3 = f_hit(nwW, ratW, t3On, t3, lvlW, 3)
+
+bool hM_1 = f_hit(nwM, ratM, t1On, t1, lvlM, 1)
+bool hM_2 = f_hit(nwM, ratM, t2On, t2, lvlM, 2)
+bool hM_3 = f_hit(nwM, ratM, t3On, t3, lvlM, 3)
+
+// raise each latch so the same tier cannot fire twice in one bar
+if h4_3
+    lvl4 := 3
+else if h4_2
+    lvl4 := 2
+else if h4_1
+    lvl4 := 1
+if hD_3
+    lvlD := 3
+else if hD_2
+    lvlD := 2
+else if hD_1
+    lvlD := 1
+if h15_3
+    lvl15 := 3
+else if h15_2
+    lvl15 := 2
+else if h15_1
+    lvl15 := 1
+if hW_3
+    lvlW := 3
+else if hW_2
+    lvlW := 2
+else if hW_1
+    lvlW := 1
+if hM_3
+    lvlM := 3
+else if hM_2
+    lvlM := 2
+else if hM_1
+    lvlM := 1
+
+bool any1 = h4_1 or hD_1 or h15_1 or hW_1 or hM_1
+bool any2 = h4_2 or hD_2 or h15_2 or hW_2 or hM_2
+bool any3 = h4_3 or hD_3 or h15_3 or hW_3 or hM_3
+
+// ── Alerts: one per timeframe per tier ────────────────────────────────
+alertcondition(h4_1,  "4H >= Tier 1",  "{{ticker}} 4H — volume reached tier 1 of its average")
+alertcondition(h4_2,  "4H >= Tier 2",  "{{ticker}} 4H — volume reached tier 2 of its average")
+alertcondition(h4_3,  "4H >= Tier 3",  "{{ticker}} 4H — volume reached tier 3 of its average")
+alertcondition(hD_1,  "1D >= Tier 1",  "{{ticker}} 1D — volume reached tier 1 of its average")
+alertcondition(hD_2,  "1D >= Tier 2",  "{{ticker}} 1D — volume reached tier 2 of its average")
+alertcondition(hD_3,  "1D >= Tier 3",  "{{ticker}} 1D — volume reached tier 3 of its average")
+alertcondition(h15_1, "15D >= Tier 1", "{{ticker}} 15D — volume reached tier 1 of its average")
+alertcondition(h15_2, "15D >= Tier 2", "{{ticker}} 15D — volume reached tier 2 of its average")
+alertcondition(h15_3, "15D >= Tier 3", "{{ticker}} 15D — volume reached tier 3 of its average")
+alertcondition(hW_1,  "1W >= Tier 1",  "{{ticker}} 1W — volume reached tier 1 of its average")
+alertcondition(hW_2,  "1W >= Tier 2",  "{{ticker}} 1W — volume reached tier 2 of its average")
+alertcondition(hW_3,  "1W >= Tier 3",  "{{ticker}} 1W — volume reached tier 3 of its average")
+alertcondition(hM_1,  "1M >= Tier 1",  "{{ticker}} 1M — volume reached tier 1 of its average")
+alertcondition(hM_2,  "1M >= Tier 2",  "{{ticker}} 1M — volume reached tier 2 of its average")
+alertcondition(hM_3,  "1M >= Tier 3",  "{{ticker}} 1M — volume reached tier 3 of its average")
+alertcondition(any1,  "Any TF >= Tier 1", "{{ticker}} — volume reached tier 1 on a monitored timeframe")
+alertcondition(any2,  "Any TF >= Tier 2", "{{ticker}} — volume reached tier 2 on a monitored timeframe")
+alertcondition(any3,  "Any TF >= Tier 3", "{{ticker}} — volume reached tier 3 on a monitored timeframe")
+
+// highest tier a ratio reaches, for the message and the table
+f_tier(float _r) =>
+    t3On and _r >= t3 ? 3 : t2On and _r >= t2 ? 2 : t1On and _r >= t1 ? 1 : 0
+
+f_tierTxt(int _t) =>
+    _t == 3 ? str.tostring(t3, "0.#") + "x" :
+     _t == 2 ? str.tostring(t2, "0.#") + "x" :
+     _t == 1 ? str.tostring(t1, "0.#") + "x" : "–"
+
+f_msg(string _tf, float _ratio, float _px) =>
+    syminfo.ticker + " | " + _tf + " | VOLUME " + str.tostring(_ratio, "0.00") + "x" +
+     "\nTier reached: " + f_tierTxt(f_tier(_ratio)) +
+     "\nAverage: " + avgType + " " + str.tostring(avgLen) +
+     "\nPrice now: " + str.tostring(_px, format.mintick) +
+     "\nBar is still forming — volume can only rise from here."
+
+// FIX: freq_all instead of freq_once_per_bar. The varip latch above already
+// limits each tier to one alert per bar; once_per_bar was swallowing the
+// higher tiers because all three tiers share one alert() call per timeframe.
+if h4_1 or h4_2 or h4_3
+    alert(f_msg("4H",  rat4,  c4),  alert.freq_all)
+if hD_1 or hD_2 or hD_3
+    alert(f_msg("1D",  ratD,  cD),  alert.freq_all)
+if h15_1 or h15_2 or h15_3
+    alert(f_msg("15D", rat15, c15), alert.freq_all)
+if hW_1 or hW_2 or hW_3
+    alert(f_msg("1W",  ratW,  cW),  alert.freq_all)
+if hM_1 or hM_2 or hM_3
+    alert(f_msg("1M",  ratM,  cM),  alert.freq_all)
+
+// ── Chart marker: this chart's own bar, coloured by tier ──────────────
+float cAvg   = f_avg()
+float cRatio = cAvg > 0 ? volume / cAvg : 0.0
+int   cTier  = bar_index >= 1 and cAvg > 0 ? f_tier(cRatio) : 0
+
+plotshape(cTier == 1, "Tier 1", shape.triangleup, location.belowbar, color.new(#F5A623, 0), size = size.tiny)
+plotshape(cTier == 2, "Tier 2", shape.triangleup, location.belowbar, color.new(#E8622A, 0), size = size.tiny)
+plotshape(cTier == 3, "Tier 3", shape.triangleup, location.belowbar, color.new(#8B0000, 0), size = size.small)
+
+// ── Status table ──────────────────────────────────────────────────────
+color INK = #000000
+
+var table tbl = table.new(position.top_right, 3, 7, border_width = 1,
+     frame_width = 1, frame_color = color.new(color.gray, 50))
+
+f_hdr(int _c, string _t) =>
+    table.cell(tbl, _c, 0, _t, text_color = color.white,
+         bgcolor = color.new(color.blue, 40), text_size = size.small)
+
+f_row(int _r, string _lbl, float _ratio, bool _live) =>
+    int   tr = f_tier(_ratio)
+    color tx = tr == 3 ? #8B0000 : tr == 2 ? #E8622A : tr == 1 ? #B37400 : INK
+    color bg = tr == 3 ? color.new(#8B0000, 80) :
+               tr == 2 ? color.new(#E8622A, 84) :
+               tr == 1 ? color.new(#F5A623, 86) : color.new(color.black, 88)
+    table.cell(tbl, 0, _r, _lbl, text_color = tx, bgcolor = bg, text_size = size.small)
+    table.cell(tbl, 1, _r, _live ? str.tostring(_ratio, "0.0") + "x" : "—",
+         text_color = tx, bgcolor = bg, text_size = size.small)
+    table.cell(tbl, 2, _r, _live ? f_tierTxt(tr) : "", text_color = tx, bgcolor = bg, text_size = size.small)
+
+if barstate.islast
+    f_hdr(0, "TF")
+    f_hdr(1, "Vol")
+    f_hdr(2, "Tier")
+    f_row(1, "4H",  rat4,  a4  and f_allowed("240"))
+    f_row(2, "1D",  ratD,  aD  and f_allowed("1D"))
+    f_row(3, "15D", rat15, a15 and f_allowed("15D"))
+    f_row(4, "1W",  ratW,  aW  and f_allowed("1W"))
+    f_row(5, "1M",  ratM,  aM  and f_allowed("1M"))
+    table.cell(tbl, 0, 6, avgType + " " + str.tostring(avgLen), text_color = INK,
+         bgcolor = color.new(color.black, 88), text_size = size.tiny)
+    table.cell(tbl, 1, 6, "", bgcolor = color.new(color.black, 88))
+    table.cell(tbl, 2, 6, "", bgcolor = color.new(color.black, 88))
+
+// ═══════════════════════════════════════════════════════════════════════
+//  BACKTEST  (added below — nothing above this line was changed)
+//
+//  Reuses the SAME volume rule, the SAME average settings and the SAME
+//  tiers that drive the alerts above, so what you measure here is exactly
+//  what you get alerted on.
+//
+//  It answers: when volume did what you configured, how far did price move
+//  over the next N candles, and which way did it go?
+//
+//    Total Candles  how many candles fell into that level
+//    Avg Move (%)   how far price moved on average, ignoring direction
+//    Up Prob (%)    share followed by an UP move
+//    Down Prob (%)  share followed by a DOWN move
+//    Avg Up (%)     average SIZE of those up moves
+//    Avg Down (%)   average SIZE of those down moves
+//
+//  Compare every row against "Normal (all)", which is every candle
+//  regardless of volume. If a tier matches Normal, that tier tells you
+//  nothing. Read probability and size together: a level that rises only
+//  45% of the time but gains 12% when it does and loses 4% when it does
+//  not is still favourable.
+//
+//  No lookahead: a candle is scored only once the next N candles have
+//  finished, so the last N candles are excluded from the tally.
+// ═══════════════════════════════════════════════════════════════════════
+
+gBT = "Backtest"
+btShow = input.bool(true, "Show backtest table", group = gBT)
+btHor  = input.int(20, "Look ahead this many candles", minval = 1, maxval = 200, group = gBT,
+     tooltip = "Measured on the chart's own timeframe. Use a daily chart with a longer horizon rather than a high timeframe, which has too few candles to test on.")
+btFrom = input.int(2000, "Start from year", minval = 1990, maxval = 2100, group = gBT)
+btPos  = input.string("Bottom Left", "Table position",
+     options = ["Bottom Left", "Bottom Center", "Bottom Right", "Middle Left", "Middle Center", "Top Left"], group = gBT)
+
+bt_pos() =>
+    btPos == "Bottom Center" ? position.bottom_center :
+     btPos == "Bottom Right" ? position.bottom_right :
+     btPos == "Middle Left"  ? position.middle_left  :
+     btPos == "Middle Center"? position.middle_center:
+     btPos == "Top Left"     ? position.top_left     : position.bottom_left
+
+bool btOk   = bar_index >= 1 and cAvg > 0
+int  btTier = btOk ? cTier : -1
+bool btIn   = year >= btFrom
+
+var int[]   btN    = array.new_int(4, 0)
+var float[] btMove = array.new_float(4, 0.0)
+var int[]   btUp   = array.new_int(4, 0)
+var int[]   btDn   = array.new_int(4, 0)
+var float[] btUpM  = array.new_float(4, 0.0)
+var float[] btDnM  = array.new_float(4, 0.0)
+
+bt_add(int _i, float _net) =>
+    array.set(btN,    _i, array.get(btN,    _i) + 1)
+    array.set(btMove, _i, array.get(btMove, _i) + math.abs(_net))
+    if _net > 0
+        array.set(btUp,  _i, array.get(btUp,  _i) + 1)
+        array.set(btUpM, _i, array.get(btUpM, _i) + _net)
+    if _net < 0
+        array.set(btDn,  _i, array.get(btDn,  _i) + 1)
+        array.set(btDnM, _i, array.get(btDnM, _i) + math.abs(_net))
+
+if bar_index > btHor + avgLen and btIn[btHor]
+    float bt_then = close[btHor]
+    if bt_then > 0
+        float bt_net = (close - bt_then) / bt_then * 100.0
+        int   bt_tp  = btTier[btHor]
+        if bt_tp >= 0
+            bt_add(0, bt_net)
+            if bt_tp > 0
+                bt_add(bt_tp, bt_net)
+
+var table btTbl = table.new(bt_pos(), 7, 7, border_width = 1,
+     frame_width = 1, frame_color = color.new(color.gray, 50))
+
+bt_hdr(int _c, string _t) =>
+    table.cell(btTbl, _c, 0, _t, text_color = color.white,
+         bgcolor = color.new(color.blue, 40), text_size = size.small)
+
+bt_res(int _r, string _lbl, int _i, color _tx, bool _on) =>
+    int   n  = array.get(btN, _i)
+    int   nu = array.get(btUp, _i)
+    int   nd = array.get(btDn, _i)
+    float mv = n  > 0 ? array.get(btMove, _i) / n : na
+    float up = n  > 0 ? nu / n * 100.0 : na
+    float dn = n  > 0 ? nd / n * 100.0 : na
+    float mu = nu > 0 ? array.get(btUpM, _i) / nu : na
+    float md = nd > 0 ? array.get(btDnM, _i) / nd : na
+    color bg = _i == 0 ? color.new(color.black, 84) : color.new(color.black, 90)
+    table.cell(btTbl, 0, _r, _lbl, text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 1, _r, _on ? str.tostring(n) : "off",                        text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 2, _r, _on and n  > 0 ? str.tostring(mv, "0.00") + "%" : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 3, _r, _on and n  > 0 ? str.tostring(up, "0.0") + "%"  : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 4, _r, _on and n  > 0 ? str.tostring(dn, "0.0") + "%"  : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 5, _r, _on and nu > 0 ? str.tostring(mu, "0.00") + "%" : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 6, _r, _on and nd > 0 ? str.tostring(md, "0.00") + "%" : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+
+if barstate.islast and btShow
+    bt_hdr(0, "Volume")
+    bt_hdr(1, "Total Candles")
+    bt_hdr(2, "Avg Move (%)")
+    bt_hdr(3, "Up Prob (%)")
+    bt_hdr(4, "Down Prob (%)")
+    bt_hdr(5, "Avg Up (%)")
+    bt_hdr(6, "Avg Down (%)")
+    bt_res(1, "Normal (all)", 0, #000000, true)
+    bt_res(2, str.tostring(t1, "0.#") + "x volume", 1, #B37400, t1On)
+    bt_res(3, str.tostring(t2, "0.#") + "x volume", 2, #E8622A, t2On)
+    bt_res(4, str.tostring(t3, "0.#") + "x volume", 3, #8B0000, t3On)
+    table.cell(btTbl, 0, 5, "over next " + str.tostring(btHor) + " candles", text_color = #000000,
+         bgcolor = color.new(color.black, 92), text_size = size.tiny)
+    table.cell(btTbl, 1, 5, avgType + str.tostring(avgLen), text_color = #000000,
+         bgcolor = color.new(color.black, 92), text_size = size.tiny)
+    table.cell(btTbl, 2, 5, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 3, 5, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 4, 5, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 5, 5, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 6, 5, "", bgcolor = color.new(color.black, 92))
+    string btNote = array.get(btN, 0) == 0 ?
+         "NO DATA — chart needs more than " + str.tostring(btHor + avgLen) + " candles, or lower 'Start from year'" :
+         "compare every row against Normal"
+    table.cell(btTbl, 0, 6, btNote,
+         text_color = array.get(btN, 0) == 0 ? #8B0000 : color.new(color.gray, 20),
+         bgcolor = color.new(color.black, 92), text_size = size.tiny)
+    table.cell(btTbl, 1, 6, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 2, 6, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 3, 6, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 4, 6, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 5, 6, "", bgcolor = color.new(color.black, 92))
+    table.cell(btTbl, 6, 6, "", bgcolor = color.new(color.black, 92))
+
+
+// DEBUG: remove after testing
+// plotshape(hD_1, "dbg 1D T1", shape.circle, location.abovebar, color.yellow, size = size.tiny)
+// plotshape(hD_2, "dbg 1D T2", shape.circle, location.abovebar, color.orange, size = size.tiny)
+// plotshape(hD_3, "dbg 1D T3", shape.circle, location.abovebar, color.red,    size = size.tiny)
