@@ -1,6 +1,6 @@
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════
-//  VOLUME TIERS — MULTI-TIMEFRAME ALERTS
+//  VOLUME TIERS v2.0 — MULTI-TIMEFRAME ALERTS + BACKTEST
 //
 //  Fires when a bar's volume reaches 1.5x, 2.5x or 5x its own average,
 //  on whichever of 4H / 1D / 15D / 1W / 1M you enable.
@@ -19,10 +19,9 @@
 //  SETTING ALERTS
 //    Right-click → Add alert → Condition: this indicator → then pick from
 //    the dropdown. There is one entry per timeframe per tier, e.g.
-//      "1D >= 2.5x"      "15D >= 5x"     "1W >= 1.5x"
+//      "1D >= Tier 2"    "15D >= Tier 3"   "1W >= Tier 1"
 //    plus "Any" catch-alls:
-//      "Any TF >= 1.5x"  "Any TF >= 2.5x"  "Any TF >= 5x"
-//    Trigger: Once per bar close.
+//      "Any TF >= Tier 1"  "Any TF >= Tier 2"  "Any TF >= Tier 3"
 //    Or use "Any alert() function call" for one alert covering everything,
 //    with the timeframe and exact multiple in the message text.
 //
@@ -40,7 +39,7 @@
 //  return only partial data.
 // ═══════════════════════════════════════════════════════════════════════
 
-indicator("Volume Tiers — MTF Alerts", shorttitle = "VOL TIERS", overlay = true)
+indicator("Volume Tiers v2.0", shorttitle = "VOL TIERS v2.0", overlay = true)
 
 // ── Average ───────────────────────────────────────────────────────────
 gV = "Average volume"
@@ -108,9 +107,6 @@ bool nwM  = aM  and f_allowed("1M")  and okM
 // Escalation latch: per timeframe, remember which bar we are in and the
 // highest tier already alerted for it. A tier fires the first moment it is
 // reached; a later climb to a higher tier fires that one too.
-// FIX: varip (not var) so the latch survives realtime ticks instead of
-// rolling back each tick, and bar trackers start at 0 (not na) because a
-// comparison with na is always false, which meant the latch never reset.
 varip int bar4  = 0
 varip int barD  = 0
 varip int bar15 = 0
@@ -233,9 +229,8 @@ f_msg(string _tf, float _ratio, float _px) =>
      "\nPrice now: " + str.tostring(_px, format.mintick) +
      "\nBar is still forming — volume can only rise from here."
 
-// FIX: freq_all instead of freq_once_per_bar. The varip latch above already
-// limits each tier to one alert per bar; once_per_bar was swallowing the
-// higher tiers because all three tiers share one alert() call per timeframe.
+// freq_all: the varip latch above already limits each tier to one alert
+// per bar.
 if h4_1 or h4_2 or h4_3
     alert(f_msg("4H",  rat4,  c4),  alert.freq_all)
 if hD_1 or hD_2 or hD_3
@@ -292,36 +287,37 @@ if barstate.islast
     table.cell(tbl, 2, 6, "", bgcolor = color.new(color.black, 88))
 
 // ═══════════════════════════════════════════════════════════════════════
-//  BACKTEST  (added below — nothing above this line was changed)
+//  BACKTEST v2
 //
-//  Reuses the SAME volume rule, the SAME average settings and the SAME
-//  tiers that drive the alerts above, so what you measure here is exactly
-//  what you get alerted on.
+//  Same volume rule, same average, same tiers as the alerts above.
 //
-//  It answers: when volume did what you configured, how far did price move
-//  over the next N candles, and which way did it go?
+//    Total Candles               how many candles fell into that level
+//    Avg Move (%)                average size of the N-candle move,
+//                                direction ignored
+//    No. of Bars for Avg Move %  avg candle of the best close in the
+//                                move's direction (highest close for up
+//                                moves, lowest close for down moves)
+//    Up / Down Prob              share of events ending up / down
+//    Avg Up / Down               average size of those up / down moves
 //
-//    Total Candles  how many candles fell into that level
-//    Avg Move (%)   how far price moved on average, ignoring direction
-//    Up Prob (%)    share followed by an UP move
-//    Down Prob (%)  share followed by a DOWN move
-//    Avg Up (%)     average SIZE of those up moves
-//    Avg Down (%)   average SIZE of those down moves
+//  Reading the timing column (always between 1 and N)
+//    Low       -> the move peaked early; a short hold captured it
+//    Near N    -> trend still running at the window's end; try a
+//                 longer horizon
+//    Multiply by the chart timeframe for calendar time
+//    (15D chart: 1 candle = 15 trading days).
 //
-//  Compare every row against "Normal (all)", which is every candle
-//  regardless of volume. If a tier matches Normal, that tier tells you
-//  nothing. Read probability and size together: a level that rises only
-//  45% of the time but gains 12% when it does and loses 4% when it does
-//  not is still favourable.
+//  Compare every tier against "Below <tier1>x", NOT "All candles", which
+//  also contains the tier bars.
 //
-//  No lookahead: a candle is scored only once the next N candles have
-//  finished, so the last N candles are excluded from the tally.
+//  No lookahead: an event is scored, timing included, only after the next
+//  N candles have closed, so the last N candles are left out.
 // ═══════════════════════════════════════════════════════════════════════
 
 gBT = "Backtest"
 btShow = input.bool(true, "Show backtest table", group = gBT)
 btHor  = input.int(20, "Look ahead this many candles", minval = 1, maxval = 200, group = gBT,
-     tooltip = "Measured on the chart's own timeframe. Use a daily chart with a longer horizon rather than a high timeframe, which has too few candles to test on.")
+     tooltip = "Measured on the chart's own timeframe. A daily chart with a longer horizon gives far more events than a high timeframe.")
 btFrom = input.int(2000, "Start from year", minval = 1990, maxval = 2100, group = gBT)
 btPos  = input.string("Bottom Left", "Table position",
      options = ["Bottom Left", "Bottom Center", "Bottom Right", "Middle Left", "Middle Center", "Top Left"], group = gBT)
@@ -333,18 +329,25 @@ bt_pos() =>
      btPos == "Middle Center"? position.middle_center:
      btPos == "Top Left"     ? position.top_left     : position.bottom_left
 
+// Copy of close with a guaranteed history buffer, for the variable-offset
+// lookups in the timing loop.
+float btC = close
+max_bars_back(btC, 201)
+
 bool btOk   = bar_index >= 1 and cAvg > 0
 int  btTier = btOk ? cTier : -1
 bool btIn   = year >= btFrom
 
-var int[]   btN    = array.new_int(4, 0)
-var float[] btMove = array.new_float(4, 0.0)
-var int[]   btUp   = array.new_int(4, 0)
-var int[]   btDn   = array.new_int(4, 0)
-var float[] btUpM  = array.new_float(4, 0.0)
-var float[] btDnM  = array.new_float(4, 0.0)
+// slots: 0 = all candles, 1..3 = tiers, 4 = below tier 1
+var int[]   btN    = array.new_int(5, 0)
+var float[] btMove = array.new_float(5, 0.0)
+var int[]   btUp   = array.new_int(5, 0)
+var int[]   btDn   = array.new_int(5, 0)
+var float[] btUpM  = array.new_float(5, 0.0)
+var float[] btDnM  = array.new_float(5, 0.0)
+var float[] btBP   = array.new_float(5, 0.0)   // sum of bars to best close
 
-bt_add(int _i, float _net) =>
+bt_add(int _i, float _net, int _bp) =>
     array.set(btN,    _i, array.get(btN,    _i) + 1)
     array.set(btMove, _i, array.get(btMove, _i) + math.abs(_net))
     if _net > 0
@@ -353,78 +356,87 @@ bt_add(int _i, float _net) =>
     if _net < 0
         array.set(btDn,  _i, array.get(btDn,  _i) + 1)
         array.set(btDnM, _i, array.get(btDnM, _i) + math.abs(_net))
+    if _net != 0
+        array.set(btBP, _i, array.get(btBP, _i) + _bp)
 
 if bar_index > btHor + avgLen and btIn[btHor]
-    float bt_then = close[btHor]
+    float bt_then = btC[btHor]
     if bt_then > 0
-        float bt_net = (close - bt_then) / bt_then * 100.0
+        float bt_net = (btC - bt_then) / bt_then * 100.0
         int   bt_tp  = btTier[btHor]
         if bt_tp >= 0
-            bt_add(0, bt_net)
-            if bt_tp > 0
-                bt_add(bt_tp, bt_net)
+            int bt_bp = btHor
+            if bt_net != 0
+                float best = 0.0
+                // k = candles after the signal; btC[btHor - k] is that candle's close
+                for k = 1 to btHor
+                    float r   = (btC[btHor - k] - bt_then) / bt_then * 100.0
+                    float fav = bt_net > 0 ? r : -r
+                    if k == 1 or fav > best
+                        best  := fav
+                        bt_bp := k
+            bt_add(0, bt_net, bt_bp)
+            if bt_tp == 0
+                bt_add(4, bt_net, bt_bp)
+            else
+                bt_add(bt_tp, bt_net, bt_bp)
 
-var table btTbl = table.new(bt_pos(), 7, 7, border_width = 1,
+var table btTbl = table.new(bt_pos(), 8, 8, border_width = 1,
      frame_width = 1, frame_color = color.new(color.gray, 50))
 
-bt_hdr(int _c, string _t) =>
+bt_hdr(int _c, string _t, string _tip) =>
     table.cell(btTbl, _c, 0, _t, text_color = color.white,
-         bgcolor = color.new(color.blue, 40), text_size = size.small)
+         bgcolor = color.new(color.blue, 40), text_size = size.small, tooltip = _tip)
 
 bt_res(int _r, string _lbl, int _i, color _tx, bool _on) =>
     int   n  = array.get(btN, _i)
     int   nu = array.get(btUp, _i)
     int   nd = array.get(btDn, _i)
-    float mv = n  > 0 ? array.get(btMove, _i) / n : na
+    int   nt = nu + nd
+    float mv = n  > 0 ? array.get(btMove, _i) / n  : na
+    float bp = nt > 0 ? array.get(btBP, _i)   / nt : na
     float up = n  > 0 ? nu / n * 100.0 : na
     float dn = n  > 0 ? nd / n * 100.0 : na
     float mu = nu > 0 ? array.get(btUpM, _i) / nu : na
     float md = nd > 0 ? array.get(btDnM, _i) / nd : na
     color bg = _i == 0 ? color.new(color.black, 84) : color.new(color.black, 90)
     table.cell(btTbl, 0, _r, _lbl, text_color = _tx, bgcolor = bg, text_size = size.small)
-    table.cell(btTbl, 1, _r, _on ? str.tostring(n) : "off",                        text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 1, _r, _on ? str.tostring(n) : "off",                         text_color = _tx, bgcolor = bg, text_size = size.small)
     table.cell(btTbl, 2, _r, _on and n  > 0 ? str.tostring(mv, "0.00") + "%" : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
-    table.cell(btTbl, 3, _r, _on and n  > 0 ? str.tostring(up, "0.0") + "%"  : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
-    table.cell(btTbl, 4, _r, _on and n  > 0 ? str.tostring(dn, "0.0") + "%"  : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
-    table.cell(btTbl, 5, _r, _on and nu > 0 ? str.tostring(mu, "0.00") + "%" : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
-    table.cell(btTbl, 6, _r, _on and nd > 0 ? str.tostring(md, "0.00") + "%" : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 3, _r, _on and nt > 0 ? str.tostring(bp, "0.0")        : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 4, _r, _on and n  > 0 ? str.tostring(up, "0.0") + "%"  : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 5, _r, _on and n  > 0 ? str.tostring(dn, "0.0") + "%"  : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 6, _r, _on and nu > 0 ? str.tostring(mu, "0.00") + "%" : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
+    table.cell(btTbl, 7, _r, _on and nd > 0 ? str.tostring(md, "0.00") + "%" : "—", text_color = _tx, bgcolor = bg, text_size = size.small)
 
 if barstate.islast and btShow
-    bt_hdr(0, "Volume")
-    bt_hdr(1, "Total Candles")
-    bt_hdr(2, "Avg Move (%)")
-    bt_hdr(3, "Up Prob (%)")
-    bt_hdr(4, "Down Prob (%)")
-    bt_hdr(5, "Avg Up (%)")
-    bt_hdr(6, "Avg Down (%)")
-    bt_res(1, "Normal (all)", 0, #000000, true)
-    bt_res(2, str.tostring(t1, "0.#") + "x volume", 1, #B37400, t1On)
-    bt_res(3, str.tostring(t2, "0.#") + "x volume", 2, #E8622A, t2On)
-    bt_res(4, str.tostring(t3, "0.#") + "x volume", 3, #8B0000, t3On)
-    table.cell(btTbl, 0, 5, "over next " + str.tostring(btHor) + " candles", text_color = #000000,
-         bgcolor = color.new(color.black, 92), text_size = size.tiny)
-    table.cell(btTbl, 1, 5, avgType + str.tostring(avgLen), text_color = #000000,
-         bgcolor = color.new(color.black, 92), text_size = size.tiny)
-    table.cell(btTbl, 2, 5, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 3, 5, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 4, 5, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 5, 5, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 6, 5, "", bgcolor = color.new(color.black, 92))
+    bt_hdr(0, "Volume",        "Volume level of the signal candle")
+    bt_hdr(1, "Total Candles", "Candles scored at this level")
+    bt_hdr(2, "Avg Move (%)",  "Average size of the move over the next N candles, direction ignored")
+    bt_hdr(3, "No. of Bars for Avg Move %", "Average candle of the best close in the move's direction: highest close for up moves, lowest close for down moves")
+    bt_hdr(4, "Up Prob (%)",   "Share of events that ended up")
+    bt_hdr(5, "Down Prob (%)", "Share of events that ended down")
+    bt_hdr(6, "Avg Up (%)",    "Average size of the up moves")
+    bt_hdr(7, "Avg Down (%)",  "Average size of the down moves")
+    bt_res(1, "All candles", 0, #000000, true)
+    bt_res(2, "Below " + str.tostring(t1, "0.#") + "x", 4, color.gray, true)
+    bt_res(3, str.tostring(t1, "0.#") + "x volume", 1, #B37400, t1On)
+    bt_res(4, str.tostring(t2, "0.#") + "x volume", 2, #E8622A, t2On)
+    bt_res(5, str.tostring(t3, "0.#") + "x volume", 3, #8B0000, t3On)
+    color ft = color.new(color.black, 92)
+    table.cell(btTbl, 0, 6, "over next " + str.tostring(btHor) + " candles", text_color = #000000,
+         bgcolor = ft, text_size = size.tiny)
+    table.cell(btTbl, 1, 6, avgType + " " + str.tostring(avgLen), text_color = #000000,
+         bgcolor = ft, text_size = size.tiny)
+    table.cell(btTbl, 2, 6, "1 bar = " + timeframe.period, text_color = #000000,
+         bgcolor = ft, text_size = size.tiny)
+    for c = 3 to 7
+        table.cell(btTbl, c, 6, "", bgcolor = ft)
     string btNote = array.get(btN, 0) == 0 ?
          "NO DATA — chart needs more than " + str.tostring(btHor + avgLen) + " candles, or lower 'Start from year'" :
-         "compare every row against Normal"
-    table.cell(btTbl, 0, 6, btNote,
+         "compare tiers against the Below row"
+    table.cell(btTbl, 0, 7, btNote,
          text_color = array.get(btN, 0) == 0 ? #8B0000 : color.new(color.gray, 20),
-         bgcolor = color.new(color.black, 92), text_size = size.tiny)
-    table.cell(btTbl, 1, 6, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 2, 6, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 3, 6, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 4, 6, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 5, 6, "", bgcolor = color.new(color.black, 92))
-    table.cell(btTbl, 6, 6, "", bgcolor = color.new(color.black, 92))
-
-
-// DEBUG: remove after testing
-// plotshape(hD_1, "dbg 1D T1", shape.circle, location.abovebar, color.yellow, size = size.tiny)
-// plotshape(hD_2, "dbg 1D T2", shape.circle, location.abovebar, color.orange, size = size.tiny)
-// plotshape(hD_3, "dbg 1D T3", shape.circle, location.abovebar, color.red,    size = size.tiny)
+         bgcolor = ft, text_size = size.tiny)
+    for c = 1 to 7
+        table.cell(btTbl, c, 7, "", bgcolor = ft)
